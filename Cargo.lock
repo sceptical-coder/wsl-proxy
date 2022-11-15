@@ -713,6 +713,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-metrics"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcb585a0069b53171684e22d5255984ec30d1c7304fd0a4a9a603ffd8c765cdd"
+dependencies = [
+ "futures-util",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-serde"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -938,6 +949,7 @@ dependencies = [
  "enum-map",
  "futures",
  "libc",
+ "once_cell",
  "rmp-serde 1.1.1",
  "scopeguard",
  "serde",
@@ -945,6 +957,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tokio",
+ "tokio-metrics",
  "tokio-serde",
  "tokio-util",
  "tracing",

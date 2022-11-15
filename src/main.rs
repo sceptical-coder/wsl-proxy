@@ -6,9 +6,12 @@ use enum_map::{Enum, EnumMap};
 use futures::future::{try_join_all};
 use futures::{try_join};
 use futures::{prelude::*};
+// #[cfg(windows)]
+// use once_cell::sync::Lazy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::oneshot;
+// use tokio_metrics;
 use tracing::{trace};
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -17,6 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc};
 use std::task::Poll;
+// use std::time::Duration;
 use std::{process::Stdio};
 use std::result::Result;
 use clap::{self, Parser};
@@ -76,6 +80,7 @@ struct ControlledStreams {
 struct ProxyStreams(EnumMap<StreamDir, Option<Box<TcpStream>>>);
 
 #[cfg(windows)]
+#[tracing::instrument]
 async fn connect_to_client(stream_target: StreamDir, port: u16)
    -> Result<TcpStream, Error>
 {
@@ -143,6 +148,7 @@ async fn proxy_child(mut child: Child, mut provided_streams: ProvidedStreams, mu
 }
 
 #[cfg(windows)]
+#[tracing::instrument]
 async fn start_inferior(command_line: &Vec<OsString>, ProxyStreams(mut streams): ProxyStreams) -> anyhow::Result<ExitStatus>
 {
    #[cfg(create_desktop)]
@@ -222,6 +228,7 @@ fn setup_process(cmd_line: &Vec<OsString>, io: fn() -> Stdio) -> Result<std::pro
    Ok(res)
 }
 
+#[tracing::instrument]
 async fn provide_server_streams(listener: TcpListener) -> Result<ProxyStreams, Error> {
    let mut chans = EnumMap::<StreamDir, Option<oneshot::Sender<TcpStream>>>::default();
 
@@ -293,6 +300,7 @@ async fn provide_server_streams(listener: TcpListener) -> Result<ProxyStreams, E
    }
 }
 
+#[tracing::instrument]
 async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> Result<ExitStatus, Error> {
    trace!("inferior_command_line: {:?}", inferior_cmd_line);
    let (server, ProxyStreams(mut streams)) = {
@@ -300,7 +308,8 @@ async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> 
       trace!("Bound listener at: {:#?}", listener.local_addr());
       let port = listener.local_addr()?.port();
 
-      let server_streams_fut = provide_server_streams(listener);
+      let server_streams_fut = tokio::spawn(
+         provide_server_streams(listener)).map(flatten);
       let server_cmd_line =
          once(server_path.as_os_str().to_owned())
          .chain(once("server".to_owned().into()))
@@ -332,15 +341,17 @@ async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> 
 }
 
 #[cfg(windows)]
+#[tracing::instrument]
 async fn server_main(listener_port: u16, inferior_cmd_line: Vec<OsString>) -> Result<ExitStatus, Error> {
    trace!("Before loop that connects to client");
    let cs = ProxyStreams(
       try_join_all(StreamDir::iter().map(
          |dir| {
+            // let task_monitor = TASK_MONITOR.clone();
             tokio::spawn(connect_to_client(dir, listener_port))
-            .map(flatten)
-            .map(move |res|
-               res.map(|str| (dir, str)))
+               .map(flatten)
+               .map(move |res|
+                  res.map(|str| (dir, str)))
          }))
       .await?
       .into_iter()
@@ -363,9 +374,38 @@ fn get_exit_code(e: ExitStatus) -> i32
    ExitStatusExt::into_raw(e)
 }
 
-#[tracing::instrument]
+// #[cfg(windows)]
+// static TASK_MONITOR: Lazy<tokio_metrics::TaskMonitor> = Lazy::new(|| {
+//    tokio_metrics::TaskMonitor::new()
+// });
+
 #[tokio::main]
 async fn entry_point() -> Result<Infallible, Error> {
+   // print task metrics every 500ms
+   // let task_monitor = TASK_MONITOR.clone();
+   {
+      // let task_monitor = task_monitor.clone();
+      // tokio::spawn(async move {
+      //    for interval in task_monitor.intervals() {
+      //       // pretty-print the metric interval
+      //       trace!("{:?}", interval);
+      //       // wait 500ms
+      //       tokio::time::sleep(Duration::from_millis(50)).await;
+      //    }
+      // });
+
+   //    let handle = tokio::runtime::Handle::current();
+   //    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+   //    tokio::spawn(async move {
+   //       for interval in runtime_monitor.intervals() {
+   //           // pretty-print the metric interval
+   //           trace!("{:?}", interval);
+   //           // wait 500ms
+   //           tokio::time::sleep(Duration::from_millis(500)).await;
+   //       }
+   //   });
+   }
+
    let args = Cli::try_parse()?;
    trace!("args: {:#?}", args);
    std::process::exit(get_exit_code(async {
