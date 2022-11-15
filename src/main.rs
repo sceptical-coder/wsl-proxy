@@ -6,12 +6,9 @@ use enum_map::{Enum, EnumMap};
 use futures::future::{try_join_all};
 use futures::{try_join};
 use futures::{prelude::*};
-// #[cfg(windows)]
-// use once_cell::sync::Lazy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::oneshot;
-// use tokio_metrics;
 use tracing::{trace};
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -20,7 +17,6 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc};
 use std::task::Poll;
-// use std::time::Duration;
 use std::{process::Stdio};
 use std::result::Result;
 use clap::{self, Parser};
@@ -31,10 +27,6 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use strum_macros;
 use strum::IntoEnumIterator;
 
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-
-#[cfg(windows)]
 use tokio_util::codec::FramedWrite;
 
 type Error = anyhow::Error;
@@ -48,7 +40,6 @@ enum StreamDir {
 
 #[derive(Debug, clap::Subcommand)]
 enum PeerConfig {
-   #[cfg(windows)]
    Server{listener_port: u16},
    Client{server_path: PathBuf},
 }
@@ -79,7 +70,6 @@ struct ControlledStreams {
 #[derive(Debug, Default)]
 struct ProxyStreams(EnumMap<StreamDir, Option<Box<TcpStream>>>);
 
-#[cfg(windows)]
 #[tracing::instrument]
 async fn connect_to_client(stream_target: StreamDir, port: u16)
    -> Result<TcpStream, Error>
@@ -147,10 +137,10 @@ async fn proxy_child(mut child: Child, mut provided_streams: ProvidedStreams, mu
    Ok(res)
 }
 
-#[cfg(windows)]
 #[tracing::instrument]
 async fn start_inferior(command_line: &Vec<OsString>, ProxyStreams(mut streams): ProxyStreams) -> anyhow::Result<ExitStatus>
 {
+   #[cfg(windows)]
    #[cfg(create_desktop)]
    {
       use windows::Win32::System::Threading::{GetCurrentThreadId};
@@ -194,11 +184,16 @@ async fn start_inferior(command_line: &Vec<OsString>, ProxyStreams(mut streams):
       }
    }
 
-   use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-   use std::os::windows::process::CommandExt;
-
-   let mut inferior_cmd = setup_process(command_line, || Stdio::piped())?;
-   inferior_cmd.creation_flags(CREATE_NO_WINDOW.0);
+   #[cfg(not(windows))]
+   let hider = std::convert::identity;
+   #[cfg(windows)]
+   let hider = |mut cmd: std::process::Command| {
+      use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+      use std::os::windows::process::CommandExt;
+      cmd.creation_flags(CREATE_NO_WINDOW.0);
+      cmd
+   };
+   let inferior_cmd = hider(setup_process(command_line, || Stdio::piped())?);
    let mut inferior = tokio::process::Command::from(inferior_cmd).spawn()?;
    let controlled_streams = ControlledStreams{
       stdin: Some(Box::new(inferior.stdin.take().unwrap())),
@@ -340,7 +335,6 @@ async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> 
    ).await
 }
 
-#[cfg(windows)]
 #[tracing::instrument]
 async fn server_main(listener_port: u16, inferior_cmd_line: Vec<OsString>) -> Result<ExitStatus, Error> {
    trace!("Before loop that connects to client");
@@ -371,6 +365,7 @@ fn get_exit_code(e: ExitStatus) -> i32
 #[cfg(unix)]
 fn get_exit_code(e: ExitStatus) -> i32
 {
+   use std::os::unix::process::ExitStatusExt;
    ExitStatusExt::into_raw(e)
 }
 
@@ -411,11 +406,11 @@ async fn entry_point() -> Result<Infallible, Error> {
    std::process::exit(get_exit_code(async {
          Ok::<_, Error>(match args.peer_config {
             PeerConfig::Client{server_path} => client_main(server_path, args.inferior_cmd_line).await,
-            #[cfg(windows)]
             PeerConfig::Server{listener_port} => server_main(listener_port, args.inferior_cmd_line).await,
          }?)
       }.await?))
 }
+
 fn main()
 {
    #[cfg(debug_assertions)]
