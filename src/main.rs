@@ -20,12 +20,13 @@ use std::task::Poll;
 use std::{process::Stdio};
 use std::result::Result;
 use clap::{self, Parser};
-use tokio::{net::{TcpStream, TcpListener}};
+use tokio::net::TcpStream;
 use serde;
 use tokio_serde::{SymmetricallyFramed, formats::SymmetricalMessagePack};
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use strum_macros;
 use strum::IntoEnumIterator;
+use fs2::FileExt;
 
 use tokio_util::codec::FramedWrite;
 
@@ -38,10 +39,26 @@ enum StreamDir {
    Stderr,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+enum CommunicationSide {
+   Client,
+   Server,
+}
+
+type CommmunicationId = u32;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
+struct CommunicationPeer {
+   side: CommunicationSide,
+   id: CommmunicationId,
+}
+
 #[derive(Debug, clap::Subcommand)]
 enum PeerConfig {
-   Server{listener_port: u16},
-   Client{server_path: PathBuf},
+   Server{listener_port: u16, client_pid: CommmunicationId, inferior: Vec<OsString>},
+   Client{server_path: PathBuf, inferior: Vec<OsString>},
+   #[cfg(unix)]
+   Daemon,
 }
 
 #[derive(Parser, Debug)]
@@ -49,8 +66,6 @@ enum PeerConfig {
 struct Cli {
    #[command(subcommand)]
    peer_config: PeerConfig,
-   #[arg(global = true)]
-   inferior_cmd_line: Vec<OsString>,
 }
 
 #[derive(Default)]
@@ -70,13 +85,21 @@ struct ControlledStreams {
 #[derive(Debug, Default)]
 struct ProxyStreams(EnumMap<StreamDir, Option<Box<TcpStream>>>);
 
-#[tracing::instrument]
-async fn connect_to_client(stream_target: StreamDir, port: u16)
+async fn connect_to_daemon(port: u16, peer: CommunicationPeer) -> anyhow::Result<TcpStream> {
+   trace!("Opening unmarked connection to daemon for peer: {:#?}", peer);
+   let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+   trace!("Opened unmarked connection for stream dir: {:#?}", peer);
+   let length_delimited = FramedWrite::new(&mut stream, LengthDelimitedCodec::new());
+   let mut serialized =
+      SymmetricallyFramed::new(length_delimited, SymmetricalMessagePack::<CommunicationPeer>::default());
+   serialized.send(peer).await?;
+   trace!("Marked connection to daemon for peer: {:#?}", peer);
+   Ok(stream)
+}
+
+async fn connect_to_client(mut stream: TcpStream, stream_target: StreamDir)
    -> Result<TcpStream, Error>
 {
-   trace!("Opening unmarked connection for stream dir: {:#?}", stream_target);
-   let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-   trace!("Opened unmarked connection for stream dir: {:#?}", stream_target);
    let length_delimited = FramedWrite::new(&mut stream, LengthDelimitedCodec::new());
    let mut serialized =
       SymmetricallyFramed::new(length_delimited, SymmetricalMessagePack::<StreamDir>::default());
@@ -224,7 +247,7 @@ fn setup_process(cmd_line: &Vec<OsString>, io: fn() -> Stdio) -> Result<std::pro
 }
 
 #[tracing::instrument]
-async fn provide_server_streams(listener: TcpListener) -> Result<ProxyStreams, Error> {
+async fn provide_server_streams(port: u16, peer: CommunicationPeer) -> Result<ProxyStreams, Error> {
    let mut chans = EnumMap::<StreamDir, Option<oneshot::Sender<TcpStream>>>::default();
 
    let stop_accept_token = tokio_util::sync::CancellationToken::new();
@@ -252,11 +275,11 @@ async fn provide_server_streams(listener: TcpListener) -> Result<ProxyStreams, E
 
    let acceptor = async move {
       loop {
-         trace!("Accepting connection...");
+         trace!("Connecting to daemon at {:?}", port);
 
-         let (mut str, addr) = listener.accept().await?;
+         let mut str = connect_to_daemon(port, peer).await?;
 
-         trace!("Accepted connection {:?}", addr);
+         trace!("Connected to daemon at {:?}", port);
 
          let length_delimited = FramedRead::new(&mut str, LengthDelimitedCodec::new());
          let mut deserialized = SymmetricallyFramed::new(length_delimited, SymmetricalMessagePack::<StreamDir>::default());
@@ -296,19 +319,26 @@ async fn provide_server_streams(listener: TcpListener) -> Result<ProxyStreams, E
 }
 
 #[tracing::instrument]
-async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> Result<ExitStatus, Error> {
+async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> Result<Infallible, Error> {
    trace!("inferior_command_line: {:?}", inferior_cmd_line);
    let (server, ProxyStreams(mut streams)) = {
-      let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-      trace!("Bound listener at: {:#?}", listener.local_addr());
-      let port = listener.local_addr()?.port();
+      let port_file = port_file_path()?;
+      let port_file = std::fs::File::open(port_file)?;
+      let port_file = scopeguard::guard(&port_file,
+         |pf| {
+            use fs2::FileExt;
+            let _ = pf.unlock();
+         });
+      let port = read_port_file(&port_file)?;
 
+      let pid = std::process::id();
       let server_streams_fut = tokio::spawn(
-         provide_server_streams(listener)).map(flatten);
+         provide_server_streams(port, CommunicationPeer { side: CommunicationSide::Client, id: pid })).map(flatten);
       let server_cmd_line =
          once(server_path.as_os_str().to_owned())
          .chain(once("server".to_owned().into()))
          .chain(once(port.to_string().into()))
+         .chain(once(pid.to_string().into()))
          .chain(once("--".into()))
          .chain(inferior_cmd_line.into_iter())
          .collect::<Vec<_>>();
@@ -320,7 +350,7 @@ async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> 
       (server, server_streams)
    };
 
-   proxy_child(
+   exit(proxy_child(
       server,
       ProvidedStreams {
          stdin: Some(Box::new(tokio::io::stdin())),
@@ -332,83 +362,219 @@ async fn client_main(server_path: PathBuf, inferior_cmd_line: Vec<OsString>) -> 
          stdout: Some(Box::new(streams[StreamDir::Stdout].take().unwrap())),
          stderr: Some(Box::new(streams[StreamDir::Stderr].take().unwrap())),
       },
-   ).await
+   ).await?)
 }
 
 #[tracing::instrument]
-async fn server_main(listener_port: u16, inferior_cmd_line: Vec<OsString>) -> Result<ExitStatus, Error> {
+async fn server_main(listener_port: u16, client_pid: CommmunicationId, inferior_cmd_line: Vec<OsString>) -> Result<Infallible, Error> {
    trace!("Before loop that connects to client");
+   let peer = CommunicationPeer{id: client_pid, side: CommunicationSide::Server};
    let cs = ProxyStreams(
       try_join_all(StreamDir::iter().map(
-         |dir| {
-            // let task_monitor = TASK_MONITOR.clone();
-            tokio::spawn(connect_to_client(dir, listener_port))
-               .map(flatten)
-               .map(move |res|
-                  res.map(|str| (dir, str)))
-         }))
+         |dir| tokio::spawn(async move {
+            let stream = connect_to_daemon(listener_port, peer).await?;
+            connect_to_client(stream, dir).await
+         })
+         .map(flatten)
+         .map(move |res|
+            res.map(|str| (dir, str)))
+         ))
       .await?
       .into_iter()
       .map(|(k, v)| (k, Some(Box::new(v))))
       .collect::<EnumMap<_, _>>()
    );
    trace!("Connected to client, streams: {:#?}", cs);
-   start_inferior(&inferior_cmd_line, cs).await
+   exit(start_inferior(&inferior_cmd_line, cs).await?)
 }
 
 #[cfg(not(unix))]
-fn get_exit_code(e: ExitStatus) -> i32
-{
+fn get_exit_code(e: ExitStatus) -> i32 {
    e.code().unwrap()
 }
 
 #[cfg(unix)]
-fn get_exit_code(e: ExitStatus) -> i32
-{
+fn get_exit_code(e: ExitStatus) -> i32 {
    use std::os::unix::process::ExitStatusExt;
    ExitStatusExt::into_raw(e)
 }
 
-// #[cfg(windows)]
-// static TASK_MONITOR: Lazy<tokio_metrics::TaskMonitor> = Lazy::new(|| {
-//    tokio_metrics::TaskMonitor::new()
-// });
+fn exit(e: ExitStatus) -> ! {
+   std::process::exit(get_exit_code(e))
+}
+
+fn port_file_path() -> anyhow::Result<PathBuf>
+{
+   let env_key = "XDG_RUNTIME_DIR";
+   let filename = "wsl-proxy.port";
+   let runtime_dir = std::env::var_os(env_key);
+      
+   let env_val = match runtime_dir {
+      None => anyhow::bail!("{} environment variable is expected to be set!", env_key),
+      Some(env_val) => PathBuf::from(env_val)
+   };
+   let mut env_val = std::fs::canonicalize(env_val)?;
+
+   env_val.push(filename);
+   Ok(env_val)
+}
 
 #[tokio::main]
-async fn entry_point() -> Result<Infallible, Error> {
-   // print task metrics every 500ms
-   // let task_monitor = TASK_MONITOR.clone();
-   {
-      // let task_monitor = task_monitor.clone();
-      // tokio::spawn(async move {
-      //    for interval in task_monitor.intervals() {
-      //       // pretty-print the metric interval
-      //       trace!("{:?}", interval);
-      //       // wait 500ms
-      //       tokio::time::sleep(Duration::from_millis(50)).await;
-      //    }
-      // });
-
-   //    let handle = tokio::runtime::Handle::current();
-   //    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
-   //    tokio::spawn(async move {
-   //       for interval in runtime_monitor.intervals() {
-   //           // pretty-print the metric interval
-   //           trace!("{:?}", interval);
-   //           // wait 500ms
-   //           tokio::time::sleep(Duration::from_millis(500)).await;
-   //       }
-   //   });
-   }
-
+async fn try_main() -> Result<Infallible, Error> {
    let args = Cli::try_parse()?;
    trace!("args: {:#?}", args);
-   std::process::exit(get_exit_code(async {
-         Ok::<_, Error>(match args.peer_config {
-            PeerConfig::Client{server_path} => client_main(server_path, args.inferior_cmd_line).await,
-            PeerConfig::Server{listener_port} => server_main(listener_port, args.inferior_cmd_line).await,
-         }?)
-      }.await?))
+   match args.peer_config {
+      PeerConfig::Client{server_path, inferior} => client_main(server_path, inferior).await,
+      PeerConfig::Server{listener_port, client_pid, inferior} => server_main(listener_port, client_pid, inferior).await,
+      #[cfg(unix)]
+      PeerConfig::Daemon => daemon_main().await,
+   }
+}
+
+#[cfg(unix)]
+mod daemon {
+   use tokio::net::TcpListener;
+   use std::collections::VecDeque;
+   use std::collections::HashMap;
+   use std::sync::Arc;
+   use tokio::sync::Mutex;
+   use crate::*;
+
+   struct UnpairedSocks
+   {
+      side: CommunicationSide,
+      head: TcpStream,
+      tail: VecDeque<TcpStream>,
+   }
+
+   pub struct Listener
+   {
+      listener: TcpListener,
+      unpaired_socks: Arc<Mutex<HashMap<CommmunicationId, Option<UnpairedSocks>>>>,
+   }
+
+   impl Listener {
+      pub fn new(listener: TcpListener) -> Self {
+         Self{ listener, unpaired_socks: Arc::new(Mutex::new(HashMap::new())) }
+      }
+
+      pub async fn accept(self: &Self, ) -> anyhow::Result<()> {
+         let unpaired_socks = self.unpaired_socks.clone();
+         let (mut incoming, sock_addr) = self.listener.accept().await?;
+
+         tokio::spawn(async move{
+            let length_delimited = FramedRead::new(&mut incoming, LengthDelimitedCodec::new());
+            let mut deserialized = SymmetricallyFramed::new(
+               length_delimited, SymmetricalMessagePack::<CommunicationPeer>::default());
+            match deserialized.try_next().await? {
+               None => anyhow::bail!("Someone sends jibberish on sock {}!!!", sock_addr),
+               Some(peer)  => {
+                  let mut unpaired_socks = unpaired_socks.lock().await;
+                  let unpaired = unpaired_socks.entry(peer.id).or_default();
+                  struct Pair {
+                     incoming: TcpStream,
+                     complement: TcpStream,
+                  }
+                  let (new_unpaired, pair) = match std::mem::replace(unpaired, None) {
+                     Some(mut unpaired) if unpaired.side != peer.side =>
+                        match unpaired.tail.pop_front() {
+                           None => {
+                              let complement = unpaired.head;
+                              (None, Some(Pair{incoming, complement}))
+                           }
+                           Some(new_head) => {
+                              let complement = std::mem::replace(&mut unpaired.head, new_head);
+                              (Some(unpaired), Some(Pair{complement, incoming}))
+                           }
+                        }
+                        Some(mut unpaired) => {
+                           unpaired.tail.push_back(incoming);
+                           (Some(unpaired), None)
+                        }
+                        None => {
+                           (Some(UnpairedSocks{side: peer.side, head: incoming, tail: VecDeque::default()}), None)
+                     }
+                  };
+                  *unpaired = new_unpaired;
+                  match pair {
+                     None => Ok(()),
+                     Some(Pair{incoming, complement}) => {
+                        let (inc_read, inc_write) = incoming.into_split();
+                        let (compl_read, compl_write) = complement.into_split();
+                        Ok(try_join!(
+                           proxy(Box::new(inc_read), Box::new(compl_write)),
+                           proxy(Box::new(compl_read), Box::new(inc_write)),
+                        )
+                        .map(|_|())?)
+                     }
+                  }
+               }
+            }
+         });
+         Ok(())
+      }
+   }
+}
+
+fn read_port_file(port_file: &std::fs::File) -> anyhow::Result<u16> {
+   port_file.try_lock_shared()?;
+   use std::io::BufRead;
+   let current_port = std::io::BufReader::new(port_file)
+      .lines()
+      .map(|r| r.map_err(anyhow::Error::new))
+      .map(|r|
+         r.and_then(|l| Ok(l.parse::<u16>()?)))
+      .next();
+   match current_port {
+      None => anyhow::bail!("Port file seems to be somehow empty"),
+      Some(r) => Ok(r?)
+   }
+}
+
+#[cfg(unix)]
+async fn daemon_main() -> anyhow::Result<Infallible> {
+   trace!("Daemon main");
+   use tokio::net::TcpListener;
+   match fork::daemon(true, true) {
+      Err(r) => anyhow::bail!("Failed to fork, return value is ({})", r),
+      Ok(fork::Fork::Child) => (),
+      Ok(fork::Fork::Parent(_)) => std::process::exit(0),
+   };
+   let port_file_path = port_file_path()?;
+   trace!("Port file path: {:?}", port_file_path);
+   let mut port_file = std::fs::File::options().read(true).write(true).create_new(true)
+      .open(port_file_path.clone())?;
+   let (port, listener) = {
+      let mut port_file = scopeguard::guard(&mut port_file,
+         |pf| {
+            let _ = pf.unlock();
+         });
+      port_file.try_lock_exclusive()?;
+      let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+      let port = listener.local_addr()?.port();
+      use std::io::Write;
+      writeln!(port_file, "{}", port)?;
+      use std::io::Seek;
+      port_file.rewind()?;
+      (port, listener)
+   };
+   if read_port_file(&port_file)? != port {
+      anyhow::bail!("Failed to become the daemon that will service clients")
+   }
+   {
+      let _delete_port_file = scopeguard::guard(
+         port_file_path,
+         |p| { let _ = std::fs::remove_file(p); }
+      );
+      let listener = daemon::Listener::new(listener);
+      loop {
+         tokio::select!{
+            r = tokio::signal::ctrl_c() => break r?,
+            r = listener.accept() => r?,
+         }
+      }
+   }
+   std::process::exit(0)
 }
 
 fn main()
@@ -424,7 +590,7 @@ fn main()
       let builder = builder.with_max_level(tracing::Level::TRACE);
       tracing::subscriber::set_global_default(builder.finish()).ok();
    }
-   match entry_point() {
+   match try_main() {
       Err(err) => { trace!("{}", err); },
       _ => panic!("Should not have come to be here!")
    };
