@@ -53,20 +53,22 @@ pub(crate) fn exit(e: ExitStatus) -> ! {
 }
 
 pub(crate) async fn proxy_child(mut child: Child, mut provided_streams: ProvidedStreams, mut controlled_streams: ControlledStreams)
- -> Result<ExitStatus> {
-    let streams_fut = tokio::spawn(async move {
-       try_join! (
-          proxy_residual(provided_streams.stdin.take().unwrap(), controlled_streams.stdin.take().unwrap()),
-          proxy_residual(controlled_streams.stdout.take().unwrap(), provided_streams.stdout.take().unwrap()),
-          proxy_residual(controlled_streams.stderr.take().unwrap(), provided_streams.stderr.take().unwrap()),
-       )
-    }.fuse());
-    let res = child.wait().await?;
-    if let Poll::Ready(r) = futures::poll!(streams_fut) {
-       let _ = flatten(r)?;
-    }
-    Ok(res)
- }
+-> Result<ExitStatus> {
+   let out_fut = tokio::spawn(async move {
+      try_join! (
+         child.wait(),
+         proxy_residual(controlled_streams.stdout.take().unwrap(), provided_streams.stdout.take().unwrap()),
+         proxy_residual(controlled_streams.stderr.take().unwrap(), provided_streams.stderr.take().unwrap()),
+      )
+   }.fuse());
+   let in_fut = tokio::spawn(
+   proxy_residual(provided_streams.stdin.take().unwrap(), controlled_streams.stdin.take().unwrap()).fuse(),);
+   let (exit_code, (), ()) = out_fut.map(flatten).await?;
+   if let Poll::Ready(r) = futures::poll!(in_fut) {
+      let _ = flatten(r)?;
+   }
+   Ok(exit_code)
+}
 
 pub(crate) fn setup_process(cmd_line: &Vec<OsString>, io: fn() -> Stdio) -> Result<std::process::Command, Error>
 {
